@@ -5,9 +5,6 @@ backend/**/__pycache__/
 backend/*.egg-info/
 backend/.pytest_cache/
 
-# 包含硬编码的 API Key，必须排除
-backend/config.py
-
 # Node / Vite
 frontend/node_modules/
 frontend/dist/
