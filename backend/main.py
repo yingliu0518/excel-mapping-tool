@@ -2,13 +2,13 @@ import io
 import json
 from urllib.parse import quote
 
-import pandas as pd
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from openpyxl import load_workbook
 
 from executor import execute_mapping
+from headers import SYS_DATA_START_ROW, read_sys_headers, read_user_table
 from llm_parser import parse_rules
 
 
@@ -76,25 +76,26 @@ async def execute(
     sys_bytes = await _read_bytes(sys_file)
 
     try:
-        user_df = pd.read_excel(io.BytesIO(user_bytes), sheet_name=user_sheet)
+        user_df, user_headers, user_letter_map = read_user_table(user_bytes, user_sheet)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"读取用户表失败: {e}")
 
-    user_headers = [str(c) for c in user_df.columns.tolist()]
+    try:
+        sys_headers = read_sys_headers(sys_bytes, sys_sheet)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"读取系统表表头失败: {e}")
 
     try:
         sys_wb = load_workbook(io.BytesIO(sys_bytes))
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"读取系统表失败: {e}")
 
-    if sys_sheet not in sys_wb.sheetnames:
-        raise HTTPException(status_code=400, detail=f"系统表中不存在 Sheet「{sys_sheet}」")
-
-    sys_ws = sys_wb[sys_sheet]
-    sys_headers = [cell.value for cell in sys_ws[1]]
-
     try:
-        config = parse_rules(user_headers, sys_headers, rules)
+        config = parse_rules(user_headers, sys_headers, user_letter_map, rules)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=f"规则解析失败: {e}")
     except Exception as e:
@@ -105,7 +106,14 @@ async def execute(
         raise HTTPException(status_code=400, detail="规则中未声明主键，请补充「主键：用户表[列] 对应 系统表[列]」")
 
     try:
-        sys_wb, log = execute_mapping(config, user_df, sys_wb, sys_sheet)
+        sys_wb, log = execute_mapping(
+            config,
+            user_df,
+            user_letter_map,
+            sys_wb,
+            sys_sheet,
+            sys_data_start_row=SYS_DATA_START_ROW,
+        )
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
 

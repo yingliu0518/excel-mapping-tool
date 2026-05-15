@@ -4,16 +4,23 @@ import pandas as pd
 from openpyxl import Workbook
 
 from compute import COMPUTE_FUNCTIONS
+from headers import read_two_row_headers, resolve_user_col_ref
 
 
-def _apply_filters(user_df: pd.DataFrame, filters: list[dict], warnings: list[str]) -> pd.DataFrame:
+def _apply_filters(
+    user_df: pd.DataFrame,
+    filters: list[dict],
+    user_letter_map: dict[str, str],
+    warnings: list[str],
+) -> pd.DataFrame:
     df = user_df.copy()
     for f in filters or []:
-        col = f.get("column")
+        raw_col = f.get("column")
         op = f.get("operator")
         val = f.get("value")
-        if col is None or col not in df.columns:
-            warnings.append(f"筛选跳过：用户表中不存在列「{col}」")
+        col = resolve_user_col_ref(raw_col, df.columns.tolist(), user_letter_map)
+        if col is None:
+            warnings.append(f"筛选跳过：用户表中找不到列「{raw_col}」")
             continue
         col_data = df[col].astype(str)
         target = "" if val is None else str(val)
@@ -39,11 +46,21 @@ def _set_cell(ws, row_num: int, headers: list[str], col_name: str, value: Any, w
     return True
 
 
+def _get_user_val(user_row, raw_col, df_columns, letter_map, warnings, label):
+    col = resolve_user_col_ref(raw_col, df_columns, letter_map)
+    if col is None:
+        warnings.append(f"{label} 跳过：用户表中找不到列「{raw_col}」")
+        return None, None
+    return col, user_row.get(col)
+
+
 def execute_mapping(
     config: dict,
     user_df: pd.DataFrame,
+    user_letter_map: dict[str, str],
     sys_wb: Workbook,
     sys_sheet: str,
+    sys_data_start_row: int = 4,
 ) -> tuple[Workbook, dict]:
     warnings: list[str] = []
 
@@ -51,22 +68,27 @@ def execute_mapping(
         raise ValueError(f"系统表中不存在 Sheet「{sys_sheet}」")
     ws = sys_wb[sys_sheet]
 
-    headers = [cell.value for cell in ws[1]]
+    headers = read_two_row_headers(ws)
+    df_columns = user_df.columns.tolist()
 
     key_mapping = config.get("key_mapping") or {}
-    user_key_col = key_mapping.get("user_col")
-    sys_key_col = key_mapping.get("sys_col")
-    if not user_key_col or not sys_key_col:
+    raw_user_key = key_mapping.get("user_col")
+    raw_sys_key = key_mapping.get("sys_col")
+    if not raw_user_key or not raw_sys_key:
         raise ValueError("缺少主键声明 (key_mapping)")
-    if user_key_col not in user_df.columns:
-        raise ValueError(f"用户表中不存在主键列「{user_key_col}」")
-    if sys_key_col not in headers:
-        raise ValueError(f"系统表中不存在主键列「{sys_key_col}」")
 
-    sys_key_idx = headers.index(sys_key_col)
+    user_key_col = resolve_user_col_ref(raw_user_key, df_columns, user_letter_map)
+    if user_key_col is None:
+        raise ValueError(f"用户表中找不到主键列「{raw_user_key}」")
+    if raw_sys_key not in headers:
+        raise ValueError(f"系统表中找不到主键列「{raw_sys_key}」")
+
+    sys_key_idx = headers.index(raw_sys_key)
 
     sys_index: dict[str, int] = {}
-    for row_num, row in enumerate(ws.iter_rows(min_row=2), start=2):
+    for row_num, row in enumerate(ws.iter_rows(min_row=sys_data_start_row), start=sys_data_start_row):
+        if sys_key_idx >= len(row):
+            continue
         key_val = row[sys_key_idx].value
         if key_val is None:
             continue
@@ -74,7 +96,7 @@ def execute_mapping(
         if key_str:
             sys_index[key_str] = row_num
 
-    filtered_df = _apply_filters(user_df, config.get("filters") or [], warnings)
+    filtered_df = _apply_filters(user_df, config.get("filters") or [], user_letter_map, warnings)
     filtered_count = len(filtered_df)
 
     updated_count = 0
@@ -96,19 +118,21 @@ def execute_mapping(
             mtype = mapping.get("type")
 
             if mtype == "copy":
-                src_col = mapping.get("source_column")
-                tgt_col = mapping.get("target_column")
-                if src_col is None or src_col not in user_df.columns:
-                    warnings.append(f"copy 跳过：用户表中不存在列「{src_col}」")
+                _, value = _get_user_val(
+                    user_row, mapping.get("source_column"), df_columns, user_letter_map, warnings, "copy"
+                )
+                if value is None and resolve_user_col_ref(
+                    mapping.get("source_column"), df_columns, user_letter_map
+                ) is None:
                     continue
-                _set_cell(ws, row_num, headers, tgt_col, user_row.get(src_col), warnings)
+                _set_cell(ws, row_num, headers, mapping.get("target_column"), value, warnings)
 
             elif mtype == "conditional":
-                src_col = mapping.get("source_column")
-                if src_col is None or src_col not in user_df.columns:
-                    warnings.append(f"conditional 跳过：用户表中不存在列「{src_col}」")
+                src_col, src_val_raw = _get_user_val(
+                    user_row, mapping.get("source_column"), df_columns, user_letter_map, warnings, "conditional"
+                )
+                if src_col is None:
                     continue
-                src_val_raw = user_row.get(src_col)
                 src_val = "" if src_val_raw is None or (isinstance(src_val_raw, float) and pd.isna(src_val_raw)) else str(src_val_raw)
                 matched = False
                 for cond in mapping.get("conditions") or []:
@@ -139,12 +163,13 @@ def execute_mapping(
                 if fn is None:
                     warnings.append(f"compute 跳过：未知函数「{fn_name}」")
                     continue
-                src_cols = mapping.get("source_columns") or []
-                missing = [c for c in src_cols if c not in user_df.columns]
+                raw_src_cols = mapping.get("source_columns") or []
+                resolved = [resolve_user_col_ref(c, df_columns, user_letter_map) for c in raw_src_cols]
+                missing = [raw for raw, r in zip(raw_src_cols, resolved) if r is None]
                 if missing:
-                    warnings.append(f"compute 跳过：用户表中不存在列 {missing}")
+                    warnings.append(f"compute 跳过：用户表中找不到列 {missing}")
                     continue
-                result = fn(user_row, src_cols)
+                result = fn(user_row, resolved)
                 _set_cell(ws, row_num, headers, mapping.get("target_column"), result, warnings)
 
             else:
