@@ -57,6 +57,20 @@ export default function ResultPanel({ result }) {
               <StatBlock label="跳过行数" value={log?.skipped_count ?? 0} tone="amber" />
             </div>
 
+            {log?.timings && (
+              <div>
+                <div className="text-sm font-medium text-slate-700 mb-1">耗时分布（秒）</div>
+                <div className="grid grid-cols-2 md:grid-cols-3 gap-2 text-xs">
+                  {Object.entries(log.timings).map(([k, v]) => (
+                    <div key={k} className="px-2 py-1.5 bg-slate-50 border border-slate-200 rounded flex justify-between">
+                      <span className="text-slate-600">{k}</span>
+                      <span className="font-mono text-slate-900">{v}s</span>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
+
             {log?.skipped_keys?.length > 0 && (
               <div>
                 <div className="text-sm font-medium text-slate-700 mb-1">

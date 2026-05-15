@@ -5,24 +5,34 @@
 用户表：第 1 行 + 第 2 行表头，第 3 行起数据
 
 约定（两表通用）：
-- 纯属性列：第 1 行有名字（与第 2 行垂直合并，所以第 2 行单元格 value=None）
+- 纯属性列：第 1 行有名字（与第 2 行垂直合并，所以第 2 行 value=None）
 - 活动列：第 1 行是横向合并的活动名，第 2 行是子列名 → 扁平化为 "活动名.子列名"
 - 用户表特殊情况：第 1 行整行为空，第 2 行直接是列名 → 扁平化为 "子列名"
+
+性能策略：
+- 用户表只读一次（pandas + python-calamine 引擎，Rust 流式实现）
+- 系统表的全功能加载只发生在 main.py 里一次，配合 read_two_row_headers 读表头
 """
 import io
 from typing import Optional
 
 import pandas as pd
-from openpyxl import load_workbook
 from openpyxl.utils import get_column_letter
 from openpyxl.worksheet.worksheet import Worksheet
+
+
+SYS_DATA_START_ROW = 4
+USER_DATA_START_ROW = 3
 
 
 def _resolve_merged_value(ws: Worksheet, row: int, col: int):
     cell = ws.cell(row=row, column=col)
     if cell.value is not None:
         return cell.value
-    for mr in ws.merged_cells.ranges:
+    merged_ranges = getattr(ws, "merged_cells", None)
+    if merged_ranges is None:
+        return None
+    for mr in merged_ranges.ranges:
         if mr.min_row <= row <= mr.max_row and mr.min_col <= col <= mr.max_col:
             anchor = ws.cell(mr.min_row, mr.min_col)
             return anchor.value
@@ -38,7 +48,7 @@ def _flat_name(top, bottom) -> str:
 
 
 def read_two_row_headers(ws: Worksheet) -> list[str]:
-    """读取一个 worksheet 的双层表头，返回扁平化的列名列表（按列顺序）。"""
+    """从已加载的 openpyxl Worksheet 读取双层表头，返回扁平后的列名列表。"""
     max_col = ws.max_column or 0
     result = []
     for col in range(1, max_col + 1):
@@ -48,45 +58,64 @@ def read_two_row_headers(ws: Worksheet) -> list[str]:
     return result
 
 
-SYS_DATA_START_ROW = 4
-USER_DATA_START_ROW = 3
+def _clean_cell(v) -> str:
+    if v is None:
+        return ""
+    if isinstance(v, float) and pd.isna(v):
+        return ""
+    s = str(v).strip()
+    if s.startswith("Unnamed:"):
+        return ""
+    return s
+
+
+def _read_excel_fast(file_bytes: bytes, sheet_name: str, **kwargs) -> pd.DataFrame:
+    """优先用 calamine 引擎读取；不可用时回落到 openpyxl 引擎。"""
+    try:
+        return pd.read_excel(
+            io.BytesIO(file_bytes),
+            sheet_name=sheet_name,
+            engine="calamine",
+            **kwargs,
+        )
+    except (ImportError, ValueError):
+        return pd.read_excel(io.BytesIO(file_bytes), sheet_name=sheet_name, **kwargs)
 
 
 def read_user_table(file_bytes: bytes, sheet_name: str) -> tuple[pd.DataFrame, list[str], dict[str, str]]:
     """
-    读取用户表：用 openpyxl 解析双层表头，用 pandas 从第 3 行起读数据。
-    返回 (DataFrame, headers, letter_map)
-    letter_map: {"A": "工号", "P": "状态", "AH": "交付状态", ...}
+    读取用户表（双层表头，第 3 行起数据）。返回 (DataFrame, headers, letter_map)。
+    单次流式读取，依赖 pandas + calamine。
+    合并单元格通过 pandas 的 MultiIndex + forward-fill 还原：
+    - 横向合并的活动名只在锚点列有值，其余列为 NaN，forward-fill 把活动名"摊开"到所有子列
+    - 垂直合并的属性列在第 2 行为 NaN，会被 _clean_cell 当作空字符串处理
     """
-    wb = load_workbook(io.BytesIO(file_bytes), data_only=True, read_only=False)
-    if sheet_name not in wb.sheetnames:
-        raise ValueError(f"用户表中不存在 Sheet「{sheet_name}」")
-    ws = wb[sheet_name]
-    headers = read_two_row_headers(ws)
+    df = _read_excel_fast(file_bytes, sheet_name, header=[0, 1])
 
-    df = pd.read_excel(
-        io.BytesIO(file_bytes),
-        sheet_name=sheet_name,
-        header=None,
-        skiprows=2,
-    )
-    if df.shape[1] > len(headers):
-        df = df.iloc[:, : len(headers)]
-    elif df.shape[1] < len(headers):
-        headers = headers[: df.shape[1]]
+    level0_raw = df.columns.get_level_values(0).tolist()
+    level1_raw = df.columns.get_level_values(1).tolist()
+
+    level0_filled = []
+    last = ""
+    for v in level0_raw:
+        s = _clean_cell(v)
+        if not s:
+            level0_filled.append(last)
+        else:
+            last = s
+            level0_filled.append(s)
+
+    headers: list[str] = []
+    for top, bot_raw in zip(level0_filled, level1_raw):
+        bot = _clean_cell(bot_raw)
+        if top and bot and top != bot:
+            headers.append(f"{top}.{bot}")
+        else:
+            headers.append(top or bot)
+
     df.columns = headers
-
     letter_map = {get_column_letter(i + 1): h for i, h in enumerate(headers) if h}
     return df, headers, letter_map
-
-
-def read_sys_headers(file_bytes: bytes, sheet_name: str) -> list[str]:
-    """读取系统表表头（仅返回扁平化列名）。"""
-    wb = load_workbook(io.BytesIO(file_bytes), data_only=True, read_only=True)
-    if sheet_name not in wb.sheetnames:
-        raise ValueError(f"系统表中不存在 Sheet「{sheet_name}」")
-    ws = wb[sheet_name]
-    return read_two_row_headers(ws)
 
 
 def resolve_user_col_ref(ref, headers: list[str], letter_map: dict[str, str]) -> Optional[str]:
