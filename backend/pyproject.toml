@@ -1,0 +1,16 @@
+[project]
+name = "excel-mapping-backend"
+version = "0.1.0"
+description = "Excel 字段映射填充工具后端"
+requires-python = ">=3.10"
+dependencies = [
+    "fastapi>=0.115.0",
+    "uvicorn[standard]>=0.30.0",
+    "python-multipart>=0.0.9",
+    "openpyxl>=3.1.5",
+    "pandas>=2.2.0",
+    "anthropic>=0.40.0",
+]
+
+[tool.uv]
+package = false
